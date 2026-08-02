@@ -2,10 +2,13 @@ import sys
 import fitz  # PyMuPDF
 import json
 import os
+import re
 import io
 import hashlib
 import zipfile
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 import markdown
@@ -1323,25 +1326,50 @@ def _build_apply_css(params):
     para_spacing = params.get("para_spacing", 3)
     indent_chars = params.get("indent_chars", 2)
     justify = params.get("justify", False)
-    font_weight = params.get("font_weight", "normal")
     mt = params.get("margin_top", 0)
     mb = params.get("margin_bottom", 0)
     ml = params.get("margin_left", 20)
     mr = params.get("margin_right", 20)
-    wnm = {"normal": 400, "bold": 700, "lighter": 300, "bolder": 600}
-    fw = wnm.get(font_weight, 400)
     ta = "justify" if justify else "left"
 
     css = f"@page {{ margin-top: {mt}pt; margin-bottom: {mb}pt; margin-left: {ml}pt; margin-right: {mr}pt; }}"
-    all_sel = "*"
-    css += f"{all_sel} {{ font-weight: {fw} !important; font-size: {fontsize}pt !important; line-height: {line_height} !important; }}"
     block_sel = "body, p, div, span, h1, h2, h3, h4, h5, h6, li, td, th, article, section, nav, header, footer, aside, blockquote, pre, code, ul, ol, dl, dt, dd, figure, figcaption"
-    css += f"{block_sel} {{ font-weight: {fw} !important; font-size: {fontsize}pt !important; line-height: {line_height} !important; }}"
+    css += f"{block_sel} {{ line-height: {line_height} !important; }}"
     p_sel = "p, div, li, td, th, blockquote, article, section, nav, header, footer, aside, figure, figcaption, dd, dt"
     css += f"{p_sel} {{ text-indent: {indent_chars}em !important; text-align: {ta} !important; margin-top: 0 !important; margin-bottom: {para_spacing}pt !important; }}"
     css += f"h1, h2, h3, h4, h5, h6 {{ text-indent: 0 !important; text-align: left !important; margin-top: {para_spacing * 2}pt !important; margin-bottom: {para_spacing}pt !important; }}"
     css += f"ul, ol {{ margin-top: 0 !important; margin-bottom: {para_spacing}pt !important; padding-left: 2em !important; }}"
     return css
+
+
+def _modify_epub_css_in_memory(epub_bytes, extra_css):
+    """PyMuPDF的apply_css()对EPUB无效，需要直接修改EPUB内部的CSS文件。
+    返回修改后的EPUB字节流。
+    """
+    import io
+    import zipfile
+
+    extra_rule = "\n/* TactiReader injected */\n" + extra_css + "\n"
+
+    out_buf = io.BytesIO()
+    try:
+        with zipfile.ZipFile(io.BytesIO(epub_bytes), "r") as zin:
+            with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename.lower().endswith(".css"):
+                        try:
+                            text = data.decode("utf-8", errors="ignore")
+                            if "TactiReader injected" not in text:
+                                text += extra_rule
+                            data = text.encode("utf-8")
+                        except Exception:
+                            pass
+                    zout.writestr(item, data)
+    except Exception as e:
+        print(f"[_modify_epub_css_in_memory] failed: {e}")
+        return epub_bytes, False
+    return out_buf.getvalue(), True
 
 
 class EpubPreviewDialog(QDialog):
@@ -1575,7 +1603,9 @@ class EpubPreviewDialog(QDialog):
 
             new_doc = fitz.open(stream=self._raw_epub_data, filetype="epub")
             css = _build_apply_css(params)
-            new_doc.apply_css(css)
+            # PyMuPDF的apply_css()对EPUB无效，直接修改EPUB内部CSS
+            modified_bytes, _ = _modify_epub_css_in_memory(self._raw_epub_data, css)
+            new_doc = fitz.open(stream=modified_bytes, filetype="epub")
             new_doc.layout(fontsize=fontsize, width=page_w_pt, height=page_h_pt)
 
             old_doc = self.doc
@@ -2599,6 +2629,52 @@ class TacticalPane(QLabel):
         clear_annot_action.triggered.connect(_confirm_clear_annotations)
         menu.addAction(clear_annot_action)
 
+        # === EPUB 专用：图片列表 & 脚注列表 ===
+        if getattr(main_window, 'is_epub', False) and main_window.pdf_path:
+            menu.addSeparator()
+
+            img_list_action = QAction(main_window.tr("图片列表"), self)
+            fn_list_action = QAction(main_window.tr("脚注列表"), self)
+
+            def _show_image_list():
+                try:
+                    focused_pn = self.page_num
+                    images, _ = _get_page_items(
+                        main_window.pdf_path, main_window.doc, focused_pn,
+                        chapter_map=main_window._epub_chapter_map,
+                        images_src=main_window._epub_images_src,
+                        footnotes_src=main_window._epub_footnotes_src,
+                    )
+                    if images:
+                        dlg = ImageListDialog(images, main_window)
+                        dlg.exec_()
+                    else:
+                        QMessageBox.information(main_window, '图片列表', '当前页面未找到图片。')
+                except Exception as e:
+                    QMessageBox.warning(main_window, '错误', f'解析图片失败: {e}')
+
+            def _show_footnote_list():
+                try:
+                    focused_pn = self.page_num
+                    _, footnotes = _get_page_items(
+                        main_window.pdf_path, main_window.doc, focused_pn,
+                        chapter_map=main_window._epub_chapter_map,
+                        images_src=main_window._epub_images_src,
+                        footnotes_src=main_window._epub_footnotes_src,
+                    )
+                    if footnotes:
+                        dlg = FootnoteListDialog(footnotes, main_window)
+                        dlg.exec_()
+                    else:
+                        QMessageBox.information(main_window, '脚注列表', '当前页面未找到脚注。')
+                except Exception as e:
+                    QMessageBox.warning(main_window, '错误', f'解析脚注失败: {e}')
+
+            img_list_action.triggered.connect(_show_image_list)
+            fn_list_action.triggered.connect(_show_footnote_list)
+            menu.addAction(img_list_action)
+            menu.addAction(fn_list_action)
+
         menu.exec_(event.globalPos())
 
     def _on_text_input_changed(self):
@@ -3209,6 +3285,9 @@ class TactiReader(QMainWindow):
         self.total_pages = 0
         self.is_epub = False
         self.epub_layout_params = None
+        self._epub_chapter_map = {}       # page_num(1-idx) → html_filename
+        self._epub_images_src = []        # 缓存的图片列表
+        self._epub_footnotes_src = []     # 缓存的脚注列表
         self.last_focused_pane = "right"  # 可选值: 'left' 或 'right'
         self._theme_page_cache = {}  # 主题页面缓存：(page_num, theme) -> QPixmap
         # Auto-show help on first run (if no bookmarks/config exist)
@@ -3918,6 +3997,9 @@ class TactiReader(QMainWindow):
             self.pdf_path = notebook_path
             self.is_epub = False
             self.epub_layout_params = None
+            self._epub_chapter_map = {}
+            self._epub_images_src = []
+            self._epub_footnotes_src = []
             self.total_pages = len(self.doc)
 
             # === 清空页面缓存，避免旧文档页面残留 ===
@@ -4526,6 +4608,9 @@ class TactiReader(QMainWindow):
             self.pdf_path = pdf_path
             self.is_epub = False
             self.epub_layout_params = None
+            self._epub_chapter_map = {}
+            self._epub_images_src = []
+            self._epub_footnotes_src = []
             self.total_pages = len(self.doc)
 
             # === 清空页面缓存，避免旧文档页面残留 ===
@@ -4638,9 +4723,10 @@ class TactiReader(QMainWindow):
                 page_w_pt = page_w_px * pt_per_px
                 page_h_pt = page_h_px * pt_per_px
 
-            self.doc = fitz.open(stream=self._epub_raw_cache, filetype="epub")
             css = _build_apply_css(params)
-            self.doc.apply_css(css)
+            # PyMuPDF的apply_css()对EPUB无效，直接修改EPUB内部CSS
+            modified_bytes, _ = _modify_epub_css_in_memory(self._epub_raw_cache, css)
+            self.doc = fitz.open(stream=modified_bytes, filetype="epub")
 
             self.doc.layout(fontsize=fontsize, width=page_w_pt, height=page_h_pt)
             self.total_pages = len(self.doc)
@@ -4740,6 +4826,10 @@ class TactiReader(QMainWindow):
             self.default_fit_mode = "fit_page"
             self._apply_epub_layout(saved_params)
             self.total_pages = len(self.doc)
+
+            # 预计算页码→HTML源文件映射 & 缓存图片/脚注
+            self._epub_chapter_map = _build_page_to_chapter_map(self.pdf_path, self.doc)
+            self._epub_images_src, self._epub_footnotes_src = _parse_epub_html_source(self.pdf_path)
 
             self.load_config()
             if self.is_epub:
@@ -5065,7 +5155,8 @@ class TactiReader(QMainWindow):
     def serialize_annotations(self, obj):
         return serialize_annotations(obj)
 
-    def render_page(self, page_num):
+    def render_page(self, page_num, apply_theme=True):
+        """渲染单页，可选是否应用主题变换"""
         if page_num < 0 or page_num >= self.total_pages:
             return QPixmap()
 
@@ -5077,6 +5168,7 @@ class TactiReader(QMainWindow):
         try:
             page = self.doc[page_num]
             is_epub = getattr(self, 'is_epub', False)
+            # 渲染倍率：PDF 保持 2.0（保证清晰度），EPUB 用 1.5
             mat = fitz.Matrix(1.5, 1.5) if is_epub else fitz.Matrix(2.0, 2.0)
             pix = page.get_pixmap(matrix=mat)
             stride = pix.stride if pix.stride is not None else pix.width * 3
@@ -5085,7 +5177,7 @@ class TactiReader(QMainWindow):
             pixmap = QPixmap.fromImage(qt_img)
 
             # 非浅色主题下，对页面像素应用主题映射
-            if getattr(self, 'current_theme', 'light') != 'light':
+            if apply_theme and getattr(self, 'current_theme', 'light') != 'light':
                 W_hex, B_hex = THEMES[self.current_theme]
                 theme = self.current_theme
                 if theme == 'night':
@@ -5108,6 +5200,71 @@ class TactiReader(QMainWindow):
             print(f"Render error: {e}")
             return QPixmap()
 
+    def _pre_render_pages(self, current_page):
+        """异步预渲染当前页附近的页面（使用独立文档句柄保证线程安全）"""
+        if not self.pdf_path or not self.doc:
+            return
+        pages_to_render = []
+        for offset in range(-3, 4):
+            page_num = current_page + offset
+            if 0 <= page_num < self.total_pages:
+                cache_key = (page_num, getattr(self, 'current_theme', 'light'))
+                if cache_key not in self._theme_page_cache:
+                    pages_to_render.append(page_num)
+        if not pages_to_render:
+            return
+
+        # 用独立文档句柄在后台渲染，只返回 QImage（线程安全），QPixmap 转换在主线程
+        file_path = self.pdf_path
+        is_epub = getattr(self, 'is_epub', False)
+        theme = getattr(self, 'current_theme', 'light')
+        W_hex, B_hex = THEMES.get(theme, ('#FFFFFF', '#000000'))
+        # 统一使用 2.0x 倍率，与主渲染一致
+        scale = 2.0 if not is_epub else 1.5
+
+        def _render_one(page_num):
+            try:
+                doc = fitz.open(file_path)
+                page = doc[page_num]
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+                stride = pix.stride if pix.stride is not None else pix.width * 3
+                img_format = QImage.Format_RGBA8888 if pix.alpha else QImage.Format_RGB888
+                qt_img = QImage(pix.samples, pix.width, pix.height, stride, img_format).copy()
+                doc.close()
+                # 应用主题变换
+                if theme != 'light':
+                    temp_pixmap = QPixmap.fromImage(qt_img)
+                    if theme == 'night':
+                        temp_pixmap = transform_pixmap(temp_pixmap, W_hex, B_hex, grayscale='night')
+                    elif theme == 'eink':
+                        temp_pixmap = transform_pixmap(temp_pixmap, W_hex, B_hex, grayscale='eink')
+                    elif theme == 'invert':
+                        temp_pixmap = transform_pixmap(temp_pixmap, W_hex, B_hex, invert=True)
+                    else:
+                        temp_pixmap = transform_pixmap(temp_pixmap, W_hex, B_hex)
+                    qt_img = temp_pixmap.toImage()
+                return page_num, qt_img
+            except Exception as e:
+                print(f"Pre-render error page {page_num}: {e}")
+                return page_num, None
+
+        def _on_done(future):
+            page_num, qt_img = future.result()
+            if qt_img and not qt_img.isNull():
+                cache_key = (page_num, theme)
+                if cache_key not in self._theme_page_cache:
+                    pixmap = QPixmap.fromImage(qt_img)
+                    cache_limit = 40 if is_epub else 20
+                    if len(self._theme_page_cache) >= cache_limit:
+                        self._theme_page_cache.pop(next(iter(self._theme_page_cache)))
+                    self._theme_page_cache[cache_key] = pixmap
+
+        executor = ThreadPoolExecutor(max_workers=2)
+        for pn in pages_to_render:
+            f = executor.submit(_render_one, pn)
+            f.add_done_callback(_on_done)
+        executor.shutdown(wait=False)
+
     def render_facing(self):
         if not self.doc:
             return
@@ -5115,12 +5272,11 @@ class TactiReader(QMainWindow):
         right_1idx = self.right_page
         self.left_pane.setVisible(not self.single_page_mode)
 
-        # 渲染右页
+        # 渲染右页（主线程，保证 UI 响应）
         right_rotation = self.page_rotations.get(str(right_1idx), 0)
         self.right_pane.rotation = right_rotation
         right_pixmap = self.render_page(right_1idx - 1)
         right_annotations = self.get_annotations_for_page(right_1idx)
-        # 应用搜索高亮
         if self.current_search_term and right_1idx in self.search_highlights:
             self.right_pane.set_search_highlights(
                 self.search_highlights[right_1idx], self.current_search_term
@@ -5135,18 +5291,14 @@ class TactiReader(QMainWindow):
             annotations=right_annotations,
         )
 
+        # 渲染左页
         if not self.single_page_mode:
-            # 左页码：联动模式下由 _jump_to_page_internal 更新 locked_left_page
-            # 解除联动模式下 locked_left_page 保持不变
             left_page_num = max(1, min(self.locked_left_page, self.total_pages))
             self.locked_left_page = left_page_num
-
-            # 渲染左页
             left_rotation = self.page_rotations.get(str(left_page_num), 0)
             self.left_pane.rotation = left_rotation
             left_pixmap = self.render_page(left_page_num - 1)
             left_annotations = self.get_annotations_for_page(left_page_num)
-            # 应用搜索高亮
             if self.current_search_term and left_page_num in self.search_highlights:
                 self.left_pane.set_search_highlights(
                     self.search_highlights[left_page_num], self.current_search_term
@@ -5162,6 +5314,9 @@ class TactiReader(QMainWindow):
             )
 
         self.update_status()
+
+        # 异步预渲染当前页附近的页面（后台线程，不阻塞 UI）
+        self._pre_render_pages(right_1idx - 1)
 
     def get_annotations_for_page(self, page_num):
         """获取指定页面的批注"""
@@ -6461,6 +6616,779 @@ pre code {{
         layout = QVBoxLayout()
         layout.addWidget(self.text_edit)
         self.setLayout(layout)
+
+
+# ============================================================
+# EPUB 图片列表 & 脚注列表 & 图片查看器
+# ============================================================
+
+def _parse_epub_html_source(epub_path):
+    """解析 EPUB 源文件，提取图片列表和脚注列表。
+    返回: (images, footnotes)
+      images: [{'src': str, 'alt': str, 'data': bytes, 'mime': str, 'chapter': str}, ...]
+      footnotes: [{'marker': str, 'marker_html': str, 'content': str, 'content_html': str, 'chapter': str}, ...]
+    """
+    import xml.etree.ElementTree as ET
+
+    images = []
+    footnotes = []
+
+    try:
+        with zipfile.ZipFile(epub_path, 'r') as zf:
+            # 1. 读取 container.xml 找到 OPF 路径
+            container_xml = zf.read('META-INF/container.xml').decode('utf-8', errors='ignore')
+            opf_match = re.search(r'full-path="([^"]+)"', container_xml)
+            if not opf_match:
+                opf_match = re.search(r"full-path='([^']+)'", container_xml)
+            if not opf_match:
+                return images, footnotes
+            opf_path = opf_match.group(1)
+            opf_dir = os.path.dirname(opf_path)
+
+            # 2. 解析 OPF 获取 manifest 和 spine
+            opf_data = zf.read(opf_path).decode('utf-8', errors='ignore')
+            # 注册命名空间
+            ns = {'opf': 'http://www.idpf.org/2007/opf', 'dc': 'http://purl.org/dc/elements/1.1/'}
+            # 尝试解析 XML
+            try:
+                root = ET.fromstring(opf_data)
+            except ET.ParseError:
+                # 去掉命名空间再试
+                opf_clean = re.sub(r'\sxmlns[^=]*="[^"]*"', '', opf_data)
+                root = ET.fromstring(opf_clean)
+
+            # 收集 manifest 条目 (id -> href)
+            manifest = {}
+            for item in root.iter():
+                tag = item.tag.split('}')[-1] if '}' in item.tag else item.tag
+                if tag == 'item':
+                    item_id = item.get('id', '')
+                    href = item.get('href', '')
+                    mtype = item.get('media-type', '')
+                    manifest[item_id] = {'href': href, 'media-type': mtype}
+
+            # 收集 spine 顺序
+            spine = []
+            for item in root.iter():
+                tag = item.tag.split('}')[-1] if '}' in item.tag else item.tag
+                if tag == 'itemref':
+                    idref = item.get('idref', '')
+                    if idref in manifest:
+                        spine.append(manifest[idref])
+
+            # 3. 解析每个 HTML 文件
+            footnote_id_counter = 0
+            seen_footnote_contents = set()
+
+            for item in spine:
+                href = item['href']
+                # 解析相对路径
+                if opf_dir:
+                    html_path = os.path.normpath(os.path.join(opf_dir, href)).replace('\\', '/')
+                else:
+                    html_path = href
+
+                if not (html_path.lower().endswith(('.html', '.xhtml', '.htm', '.xml'))
+                    or item.get('media-type', '').startswith('application/xhtml')
+                    or item.get('media-type', '') == 'text/html'):
+                    continue
+
+                try:
+                    html_data = zf.read(html_path).decode('utf-8', errors='ignore')
+                except KeyError:
+                    continue
+
+                html_dir = os.path.dirname(html_path)
+                chapter_name = os.path.basename(html_path)
+
+                # ---- 提取图片 ----
+                # 在 HTML 中找所有 <img> 标签
+                img_pattern = re.compile(
+                    r'<img\b[^>]*?src\s*=\s*["\']([^"\']+)["\'][^>]*?/?>',
+                    re.IGNORECASE | re.DOTALL
+                )
+                # 找出每个 img 的上下文（父元素 100 字符内）
+                for m in img_pattern.finditer(html_data):
+                    src = m.group(1)
+                    img_tag = m.group(0)
+
+                    # 提取 alt
+                    alt_match = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', img_tag, re.IGNORECASE)
+                    alt_text = alt_match.group(1) if alt_match else ''
+
+                    # 检查父元素是否包含 footnote 标记
+                    # 取 img 标签之前的 200 字符
+                    start = max(0, m.start() - 200)
+                    context = html_data[start:m.end()]
+                    # 检查父元素 opening tag
+                    parent_match = re.search(
+                        r'<(aside|div|span|li|p|td|section)\b[^>]*?(?:epub:type\s*=\s*["\']footnote["\']|class\s*=\s*["\'][^"\']*footnote[^"\']*["\'])',
+                        context, re.IGNORECASE
+                    )
+                    if parent_match:
+                        # 这是脚注中的图片，跳过
+                        continue
+
+                    # 解析图片路径
+                    img_src = src
+                    if not img_src.startswith(('http://', 'https://', 'data:')):
+                        # 相对路径
+                        if html_dir:
+                            img_src = os.path.normpath(os.path.join(html_dir, img_src)).replace('\\', '/')
+                        # 去掉开头的 ./
+                        img_src = re.sub(r'^\./', '', img_src)
+
+                    # 尝试从 ZIP 中读取图片
+                    try:
+                        img_data = zf.read(img_src)
+                        # 判断 MIME
+                        if img_data[:4] == b'\x89PNG':
+                            mime = 'image/png'
+                        elif img_data[:3] == b'\xff\xd8\xff':
+                            mime = 'image/jpeg'
+                        elif img_data[:4] == b'GIF8':
+                            mime = 'image/gif'
+                        elif img_data[:4] == b'RIFF':
+                            mime = 'image/webp'
+                        else:
+                            mime = 'image/png'
+
+                        images.append({
+                            'src': img_src,
+                            'alt': alt_text,
+                            'data': img_data,
+                            'mime': mime,
+                            'chapter': chapter_name,
+                        })
+                    except KeyError:
+                        # 尝试其他路径变体
+                        found = False
+                        for name in zf.namelist():
+                            if name.endswith('/' + os.path.basename(img_src)) or name == os.path.basename(img_src):
+                                try:
+                                    img_data = zf.read(name)
+                                    if img_data[:4] == b'\x89PNG':
+                                        mime = 'image/png'
+                                    elif img_data[:3] == b'\xff\xd8\xff':
+                                        mime = 'image/jpeg'
+                                    else:
+                                        mime = 'image/png'
+                                    images.append({
+                                        'src': name,
+                                        'alt': alt_text,
+                                        'data': img_data,
+                                        'mime': mime,
+                                        'chapter': chapter_name,
+                                    })
+                                    found = True
+                                except Exception:
+                                    pass
+                                break
+                        if not found:
+                            pass  # 图片无法读取，跳过
+
+                # ---- 提取脚注 ----
+                # 模式1: <a epub:type="noteref" href="#fnX">...</a>
+                # 模式2: <a class="footnote-ref" href="#fnX">...</a>
+                # 模式3: <a href="#fnX" id="fnrefX">...</a>
+                noteref_pattern = re.compile(
+                    r'<a\b[^>]*?(?:epub:type\s*=\s*["\']noteref["\']|class\s*=\s*["\'](?:[^"\']*\s)?footnote-ref(?:\s[^"\']*)?["\'])[^>]*?href\s*=\s*["\']#([^"\']+)["\'][^>]*>(.*?)</a>',
+                    re.IGNORECASE | re.DOTALL
+                )
+                for ref_match in noteref_pattern.finditer(html_data):
+                    target_id = ref_match.group(1)
+                    marker_html = ref_match.group(2).strip()
+                    # 去掉 HTML 标签得到纯文本标记
+                    marker_text = re.sub(r'<[^>]+>', '', marker_html).strip()
+
+                    # 如果标记为空（图片标记），尝试从 alt 或 zy-footnote 提取
+                    if not marker_text:
+                        # 从 img 标签的 alt 属性提取
+                        alt_match = re.search(r'alt\s*=\s*["\']([^"\']*)["\']', marker_html, re.IGNORECASE)
+                        if alt_match and alt_match.group(1).strip():
+                            marker_text = alt_match.group(1).strip()[:20]
+                        else:
+                            # 从整个 a 标签的 zy-footnote 属性提取
+                            full_tag = ref_match.group(0)
+                            zy_match = re.search(r'zy-footnote\s*=\s*["\']([^"\']*)["\']', full_tag, re.IGNORECASE)
+                            if zy_match and zy_match.group(1).strip():
+                                marker_text = zy_match.group(1).strip()[:20]
+                            else:
+                                marker_text = f'[{footnote_id_counter + 1}]'
+
+                    # 查找对应的脚注内容
+                    # 模式: <aside epub:type="footnote" id="fnX">...</aside>
+                    # 模式: <li id="fnX">...</li>
+                    # 模式: <div class="footnote" id="fnX">...</div>
+                    content_patterns = [
+                        # EPUB3 footnote
+                        rf'<(?:aside|div|section)\b[^>]*?epub:type\s*=\s*["\']footnote["\'][^>]*?\bid\s*=\s*["\']{re.escape(target_id)}["\'][^>]*>(.*?)</(?:aside|div|section)>',
+                        # id-based footnote
+                        rf'<(?:aside|li|div|p|section)\b[^>]*?\bid\s*=\s*["\']{re.escape(target_id)}["\'][^>]*>(.*?)</(?:aside|li|div|p|section)>',
+                        # class="footnote" + id
+                        rf'<(?:aside|li|div|p|section)\b[^>]*?class\s*=\s*["\'][^"\']*\bfootnote\b[^"\']*["\'][^>]*?\bid\s*=\s*["\']{re.escape(target_id)}["\'][^>]*>(.*?)</(?:aside|li|div|p|section)>',
+                    ]
+
+                    content_html = ''
+                    for pat in content_patterns:
+                        cm = re.search(pat, html_data, re.IGNORECASE | re.DOTALL)
+                        if cm:
+                            content_html = cm.group(1).strip()
+                            break
+
+                    if not content_html:
+                        continue
+
+                    content_text = re.sub(r'<[^>]+>', '', content_html).strip()
+                    content_text = re.sub(r'\s+', ' ', content_text)
+
+                    # 去重（基于内容）
+                    content_key = content_text[:50]
+                    if content_key in seen_footnote_contents:
+                        continue
+                    seen_footnote_contents.add(content_key)
+
+                    footnote_id_counter += 1
+                    footnotes.append({
+                        'marker': marker_text,
+                        'marker_html': marker_html,
+                        'content': content_text,
+                        'content_html': content_html,
+                        'chapter': chapter_name,
+                        'id': target_id,
+                    })
+
+    except Exception as e:
+        print(f"[_parse_epub_html_source] Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+    return images, footnotes
+
+
+def _build_page_to_chapter_map(epub_path, doc):
+    """预计算 PyMuPDF 页码 → EPUB HTML 源文件名的映射。
+
+    一个 HTML 源文件（真实页，通常 .xhtml）可能跨多个 PyMuPDF 渲染页，
+    这些页都映射到同一个 HTML 文件。
+    返回: {page_1idx: html_basename, ...}
+    """
+    if not doc:
+        return {}
+
+    import xml.etree.ElementTree as ET
+
+    # 1. 解析 spine，按顺序收集 HTML 文件及其纯文本
+    html_files = []  # [(basename, clean_text), ...]
+
+    try:
+        with zipfile.ZipFile(epub_path, 'r') as zf:
+            container_xml = zf.read('META-INF/container.xml').decode('utf-8', errors='ignore')
+            opf_match = re.search(r'full-path="([^"]+)"', container_xml)
+            if not opf_match:
+                return {}
+            opf_path = opf_match.group(1)
+            opf_dir = os.path.dirname(opf_path)
+
+            opf_data = zf.read(opf_path).decode('utf-8', errors='ignore')
+            try:
+                root = ET.fromstring(opf_data)
+            except ET.ParseError:
+                opf_clean = re.sub(r'\sxmlns[^=]*="[^"]*"', '', opf_data)
+                root = ET.fromstring(opf_clean)
+
+            manifest = {}
+            for item in root.iter():
+                tag = item.tag.split('}')[-1] if '}' in item.tag else item.tag
+                if tag == 'item':
+                    manifest[item.get('id', '')] = {
+                        'href': item.get('href', ''),
+                        'media-type': item.get('media-type', ''),
+                    }
+
+            for item in root.iter():
+                tag = item.tag.split('}')[-1] if '}' in item.tag else item.tag
+                if tag == 'itemref':
+                    idref = item.get('idref', '')
+                    if idref in manifest:
+                        m = manifest[idref]
+                        href = m['href']
+                        if opf_dir:
+                            html_path = os.path.normpath(os.path.join(opf_dir, href)).replace('\\', '/')
+                        else:
+                            html_path = href
+
+                        if not (html_path.lower().endswith(('.html', '.xhtml', '.htm', '.xml'))
+                                or m.get('media-type', '').startswith('application/xhtml')
+                                or m.get('media-type', '') == 'text/html'):
+                            continue
+
+                        try:
+                            html_data = zf.read(html_path).decode('utf-8', errors='ignore')
+                            html_text = re.sub(r'<[^>]+>', '', html_data)
+                            html_text_clean = re.sub(r'\s+', '', html_text)
+                            html_files.append((os.path.basename(html_path), html_text_clean))
+                        except KeyError:
+                            continue
+    except Exception as e:
+        print(f"[_build_page_to_chapter_map] Error: {e}")
+        return {}
+
+    if not html_files:
+        return {}
+
+    # 2. 遍历所有 PyMuPDF 页面，逐页匹配到 HTML 源文件
+    page_map = {}
+    html_idx = 0
+    total_pages = len(doc)
+
+    for page_1idx in range(1, total_pages + 1):
+        page = doc[page_1idx - 1]
+        page_text = page.get_text("text")
+        page_text_clean = re.sub(r'\s+', '', page_text)
+
+        if not page_text_clean:
+            # 空页面，沿用上一个映射
+            if html_idx < len(html_files):
+                page_map[page_1idx] = html_files[html_idx][0]
+            continue
+
+        search_key = page_text_clean[:50]
+
+        # 先检查当前 HTML
+        if html_idx < len(html_files) and search_key in html_files[html_idx][1]:
+            page_map[page_1idx] = html_files[html_idx][0]
+        else:
+            # 当前 HTML 不匹配，向前搜寻后续 HTML
+            found = False
+            for next_idx in range(html_idx + 1, len(html_files)):
+                if search_key in html_files[next_idx][1]:
+                    html_idx = next_idx
+                    page_map[page_1idx] = html_files[html_idx][0]
+                    found = True
+                    break
+            if not found and html_idx < len(html_files):
+                page_map[page_1idx] = html_files[html_idx][0]
+
+    return page_map
+
+
+def _get_page_items(epub_path, doc, page_1idx, chapter_map=None, images_src=None, footnotes_src=None):
+    """获取焦点窗口所在 HTML 源文件中的全部图片和脚注。
+
+    page_1idx: 焦点窗口的 1-indexed 页码
+    chapter_map: 预计算的页码→HTML文件名映射
+    images_src / footnotes_src: 预解析的全书图片/脚注列表
+    """
+    # 使用预计算映射或回退
+    if chapter_map and page_1idx in chapter_map:
+        chapter = chapter_map[page_1idx]
+    else:
+        chapter = None
+
+    # 使用缓存或回退解析
+    if images_src is None or footnotes_src is None:
+        images_src, footnotes_src = _parse_epub_html_source(epub_path)
+
+    if chapter:
+        images = [img for img in images_src if img.get('chapter') == chapter]
+        footnotes = [fn for fn in footnotes_src if fn.get('chapter') == chapter]
+    else:
+        images = images_src
+        footnotes = footnotes_src
+
+    return images, footnotes
+
+
+class ImageViewer(QDialog):
+    """图片查看器：支持 Ctrl+滚轮缩放 + 鼠标拖动"""
+
+    def __init__(self, pixmap, title='', parent=None):
+        super().__init__(parent)
+        self.original_pixmap = pixmap
+        self.scale_factor = 1.0
+        self.offset = QPointF(0, 0)
+        self.drag_start = None
+        self._min_scale = 0.1
+        self._max_scale = 10.0
+
+        self.setWindowTitle(title if title else 'Image Viewer')
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self.setModal(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.setStyleSheet("background: #1a1a1a;")
+
+        # 全屏显示
+        screen = QApplication.primaryScreen().geometry()
+        self.resize(screen.width(), screen.height())
+
+        # 初始缩放：适合屏幕
+        pw = self.original_pixmap.width()
+        ph = self.original_pixmap.height()
+        sw = screen.width() - 40
+        sh = screen.height() - 40
+        self.scale_factor = min(sw / pw, sh / ph, 1.0)
+        self._update_offset_for_center()
+
+    def _update_offset_for_center(self):
+        """将图片居中"""
+        scaled_w = self.original_pixmap.width() * self.scale_factor
+        scaled_h = self.original_pixmap.height() * self.scale_factor
+        self.offset = QPointF(
+            (self.width() - scaled_w) / 2,
+            (self.height() - scaled_h) / 2,
+        )
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), QColor(26, 26, 26))
+
+        scaled_size = self.original_pixmap.size() * self.scale_factor
+        scaled_pm = self.original_pixmap.scaled(
+            scaled_size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+        )
+        painter.drawPixmap(int(self.offset.x()), int(self.offset.y()), scaled_pm)
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier:
+            # Ctrl+滚轮缩放
+            old_scale = self.scale_factor
+            delta = event.angleDelta().y() / 120
+            factor = 1.0 + delta * 0.15
+            new_scale = old_scale * factor
+            new_scale = max(self._min_scale, min(self._max_scale, new_scale))
+
+            # 以鼠标位置为中心缩放
+            mouse_pos = event.pos()
+            img_x = (mouse_pos.x() - self.offset.x()) / old_scale
+            img_y = (mouse_pos.y() - self.offset.y()) / old_scale
+
+            self.scale_factor = new_scale
+            self.offset.setX(mouse_pos.x() - img_x * new_scale)
+            self.offset.setY(mouse_pos.y() - img_y * new_scale)
+            self.update()
+        else:
+            super().wheelEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drag_start = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.drag_start:
+            delta = event.pos() - self.drag_start
+            self.offset += delta
+            self.drag_start = event.pos()
+            self.update()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.drag_start:
+            self.drag_start = None
+            self.setCursor(Qt.ArrowCursor)
+        else:
+            super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
+class ImageListDialog(QDialog):
+    """图片列表对话框：缩略图 + alt 文本，点击查看大图"""
+
+    def __init__(self, images, parent=None):
+        super().__init__(parent)
+        self.images = images
+        self.thumb_size = 180
+        self.setWindowTitle('图片列表')
+        self.setModal(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.resize(900, 650)
+        self.setStyleSheet("""
+            QDialog { background: #2b2b2b; }
+            QLabel { color: #cccccc; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        # 标题
+        title_label = QLabel(f'共 {len(images)} 张图片（ESC 关闭）')
+        title_label.setStyleSheet("font-size: 16px; color: #eee; padding: 4px;")
+        layout.addWidget(title_label)
+
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: #2b2b2b; }")
+
+        container = QWidget()
+        container.setStyleSheet("background: #2b2b2b;")
+        self.flow_layout = FlowLayout(container)
+        self.flow_layout.setSpacing(10)
+
+        for img_info in images:
+            self._add_image_card(img_info)
+
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+    def _add_image_card(self, img_info):
+        """添加一张图片卡片（缩略图 + alt文本）"""
+        card = QWidget()
+        card.setStyleSheet("background: #3a3a3a; border-radius: 6px;")
+        card.setFixedWidth(self.thumb_size + 20)
+        card.setCursor(Qt.PointingHandCursor)
+
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(8, 8, 8, 8)
+        card_layout.setSpacing(6)
+
+        # 缩略图
+        thumb_label = QLabel()
+        thumb_label.setFixedSize(self.thumb_size, self.thumb_size)
+        thumb_label.setAlignment(Qt.AlignCenter)
+        thumb_label.setStyleSheet("background: #222; border-radius: 3px;")
+
+        try:
+            pix = QPixmap()
+            pix.loadFromData(img_info['data'])
+            if not pix.isNull():
+                scaled = pix.scaled(
+                    self.thumb_size - 10, self.thumb_size - 10,
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                thumb_label.setPixmap(scaled)
+        except Exception:
+            thumb_label.setText('(加载失败)')
+
+        card_layout.addWidget(thumb_label)
+
+        # alt 文本
+        alt_text = img_info.get('alt', '') or '(无描述)'
+        alt_label = QLabel(alt_text)
+        alt_label.setWordWrap(True)
+        alt_label.setMaximumWidth(self.thumb_size)
+        alt_label.setStyleSheet("color: #aaa; font-size: 12px; background: transparent;")
+        alt_label.setAlignment(Qt.AlignCenter)
+        card_layout.addWidget(alt_label)
+
+        card.mousePressEvent = lambda e, info=img_info: self._on_image_click(info)
+        thumb_label.mousePressEvent = lambda e, info=img_info: self._on_image_click(info)
+
+        self.flow_layout.addWidget(card)
+
+    def _on_image_click(self, img_info):
+        """点击图片 → 打开查看器"""
+        try:
+            pix = QPixmap()
+            pix.loadFromData(img_info['data'])
+            if not pix.isNull():
+                title = img_info.get('alt', '') or '图片查看'
+                viewer = ImageViewer(pix, title, self)
+                viewer.exec_()
+        except Exception as e:
+            print(f"[ImageListDialog] 打开图片失败: {e}")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
+class FootnotePopupViewer(QDialog):
+    """脚注内容弹窗查看器"""
+
+    def __init__(self, marker, content_html, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f'脚注: {marker}')
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setModal(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        screen = QApplication.primaryScreen().geometry()
+        self.resize(min(700, screen.width() - 100), min(500, screen.height() - 100))
+
+        # 居中
+        self.move(
+            (screen.width() - self.width()) // 2,
+            (screen.height() - self.height()) // 2,
+        )
+
+        self.setStyleSheet("""
+            QDialog { background: #2b2b2b; border: 2px solid #555; border-radius: 8px; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        # 标题栏
+        header = QLabel(f'脚注 [{marker}]')
+        header.setStyleSheet("color: #f0c040; font-size: 18px; font-weight: bold;")
+        layout.addWidget(header)
+
+        # 分隔线
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #555;")
+        layout.addWidget(sep)
+
+        # 内容
+        content = QTextBrowser()
+        content.setOpenExternalLinks(True)
+        content.setStyleSheet("""
+            QTextBrowser {
+                background: #1e1e1e;
+                color: #ddd;
+                font-size: 15px;
+                border: none;
+                padding: 8px;
+                line-height: 1.6;
+            }
+        """)
+        content.setHtml(content_html)
+        layout.addWidget(content)
+
+        # 提示
+        hint = QLabel('ESC 关闭')
+        hint.setStyleSheet("color: #666; font-size: 12px;")
+        hint.setAlignment(Qt.AlignRight)
+        layout.addWidget(hint)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
+class FootnoteListDialog(QDialog):
+    """脚注列表对话框：左标记 + 右内容，点击查看"""
+
+    def __init__(self, footnotes, parent=None):
+        super().__init__(parent)
+        self.footnotes = footnotes
+        self.setWindowTitle('脚注列表')
+        self.setModal(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        # 窗口大小：占屏幕 60% 宽度（同目录窗口）
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        w = int(screen_geo.width() * 0.6)
+        h = int(screen_geo.height() * 0.6)
+        self.setGeometry(
+            screen_geo.x() + (screen_geo.width() - w) // 2,
+            screen_geo.y() + (screen_geo.height() - h) // 2,
+            w, h,
+        )
+
+        self.setStyleSheet("""
+            QDialog { background: #2b2b2b; }
+            QLabel { color: #cccccc; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        # 标题
+        title_label = QLabel(f'共 {len(footnotes)} 条脚注（ESC 关闭）')
+        title_label.setStyleSheet("font-size: 16px; color: #eee; padding: 4px;")
+        layout.addWidget(title_label)
+
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: #2b2b2b; }")
+
+        container = QWidget()
+        container.setStyleSheet("background: #2b2b2b;")
+        container_layout = QVBoxLayout(container)
+        container_layout.setSpacing(8)
+
+        idx = 1
+        for fn in footnotes:
+            self._add_footnote_row(container_layout, fn, idx)
+            idx += 1
+
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+
+    def _add_footnote_row(self, parent_layout, fn, idx):
+        """添加一行脚注：左边标记，右边内容预览"""
+        row = QWidget()
+        row.setStyleSheet("background: #3a3a3a; border-radius: 6px;")
+        row.setCursor(Qt.PointingHandCursor)
+        row.setMinimumHeight(50)
+
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(12, 8, 12, 8)
+        row_layout.setSpacing(12)
+
+        # 左侧：脚注标记（紧凑序号 or 图）
+        marker_html = fn.get('marker_html', '')
+        is_img_marker = '<img' in marker_html.lower()
+
+        marker_widget = QLabel()
+        marker_widget.setAlignment(Qt.AlignCenter)
+        marker_widget.setFixedWidth(50)
+        if is_img_marker:
+            marker_widget.setText('[图]')
+        else:
+            marker_widget.setText(f'[{idx}]')
+        marker_widget.setStyleSheet("""
+            color: #f0c040;
+            font-size: 23px;
+            font-weight: bold;
+            background: #444;
+            border-radius: 4px;
+            padding: 6px;
+        """)
+
+        row_layout.addWidget(marker_widget)
+
+        # 右侧：脚注内容预览
+        content_widget = QLabel()
+        content_widget.setText(fn.get('content', ''))
+        content_widget.setWordWrap(True)
+        content_widget.setStyleSheet("""
+            color: #bbb;
+            font-size: 23px;
+            background: transparent;
+            padding: 4px;
+        """)
+        row_layout.addWidget(content_widget, 1)
+
+        # 点击事件
+        row.mousePressEvent = lambda e, f=fn: self._on_footnote_click(f)
+        marker_widget.mousePressEvent = lambda e, f=fn: self._on_footnote_click(f)
+        content_widget.mousePressEvent = lambda e, f=fn: self._on_footnote_click(f)
+
+        parent_layout.addWidget(row)
+
+    def _on_footnote_click(self, fn):
+        """点击脚注 → 弹出查看器"""
+        viewer = FootnotePopupViewer(
+            fn.get('marker', '?'),
+            fn.get('content_html', fn.get('content', '')),
+            self
+        )
+        viewer.exec_()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
 
 
 if __name__ == "__main__":
